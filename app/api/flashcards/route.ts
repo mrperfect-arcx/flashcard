@@ -1,86 +1,110 @@
-import { NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+// app/api/flashcards/route.js
+export const runtime = "nodejs"; // important for Vercel: keep this route on Node (not Edge)
 
-type Flashcard = {
-  question: string;
-  answer: string;
-  tags?: string[];
-};
+function buildFlashcardPrompt(userText) {
+  return `
+You are a flashcard generator. Convert the user's notes into high-quality study flashcards.
 
-function extractJson(text: string): unknown {
-  // Prefer fenced ```json blocks if present
-  const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
-  if (fenced?.[1]) return JSON.parse(fenced[1]);
+Rules:
+- Output ONLY valid JSON (no markdown, no backticks).
+- JSON schema:
+{
+  "title": string,
+  "summary": string,
+  "cards": [
+    {
+      "front": string,
+      "back": string,
+      "tags": string[]
+    }
+  ]
+}
+- Create 12 to 25 cards depending on content depth (prefer quality).
+- Keep fronts short and exam-friendly.
+- Backs should be clear, accurate, and structured (bullets allowed as plain text).
+- Add 1-3 relevant tags per card.
 
-  // Fallback: first JSON object/array in the text
-  const first = Math.min(...[text.indexOf("["), text.indexOf("{")].filter((n) => n !== -1));
-  const last = Math.max(text.lastIndexOf("]"), text.lastIndexOf("}"));
-  if (first !== Infinity && first >= 0 && last > first) {
-    return JSON.parse(text.slice(first, last + 1));
-  }
-  throw new Error("Model did not return valid JSON");
+User notes:
+"""${userText}"""
+`.trim();
 }
 
-export async function POST(req: Request) {
+export async function POST(req) {
   try {
-    const body = await req.json();
-    const notes = String(body?.notes ?? "").trim();
-    const count = Math.max(3, Math.min(50, Number(body?.count ?? 12)));
-    const style = String(body?.style ?? "balanced");
+    const { text, notes, prompt } = await req.json().catch(() => ({}));
+    const userText = (text || notes || prompt || "").trim();
 
-    if (!notes) {
-      return NextResponse.json({ error: "Notes are required" }, { status: 400 });
+    if (!userText) {
+      return Response.json(
+        { error: "Missing input. Send { text: 'your notes' }" },
+        { status: 400 }
+      );
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) {
-      return NextResponse.json(
-        { error: "Server misconfigured: missing GEMINI_API_KEY" },
+      return Response.json(
+        { error: "Missing GROQ_API_KEY in environment variables." },
         { status: 500 }
       );
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "You are a precise flashcard generator." },
+          { role: "user", content: buildFlashcardPrompt(userText) },
+        ],
+      }),
+    });
 
-    const prompt = `You are an expert flashcard creator.
-Return ONLY valid JSON, no extra text.
+    if (!groqRes.ok) {
+      const errText = await groqRes.text();
+      return Response.json(
+        { error: "Groq request failed", details: errText },
+        { status: groqRes.status }
+      );
+    }
 
-Create ${count} high-quality flashcards from the NOTES below.
+    const data = await groqRes.json();
+    const content = data?.choices?.[0]?.message?.content;
 
-Output schema (exact):
-{\n  "title": string,\n  "flashcards": [{"question": string, "answer": string, "tags": string[]}]\n}
+    if (!content) {
+      return Response.json(
+        { error: "No content returned from Groq." },
+        { status: 502 }
+      );
+    }
 
-Rules:
-- Questions must be clear, specific, and test understanding.
-- Answers must be concise but complete.
-- No markdown.
-- Style: ${style} (balanced = mix of definitions+concepts, exam = more application, simple = easy language)
+    // Content should already be JSON string due to response_format, but we parse safely.
+    let json;
+    try {
+      json = JSON.parse(content);
+    } catch {
+      // If the model accidentally included extra text, try to extract JSON.
+      const start = content.indexOf("{");
+      const end = content.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        json = JSON.parse(content.slice(start, end + 1));
+      } else {
+        throw new Error("Model did not return valid JSON.");
+      }
+    }
 
-NOTES:\n${notes}`;
-
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
-    const parsed = extractJson(text) as any;
-
-    const title = String(parsed?.title ?? "Flashcards");
-    const flashcards = Array.isArray(parsed?.flashcards) ? parsed.flashcards : [];
-
-    const cleaned: Flashcard[] = flashcards
-      .map((c: any) => ({
-        question: String(c?.question ?? "").trim(),
-        answer: String(c?.answer ?? "").trim(),
-        tags: Array.isArray(c?.tags) ? c.tags.map((t: any) => String(t)).slice(0, 6) : [],
-      }))
-      .filter((c: Flashcard) => c.question && c.answer)
-      .slice(0, count);
-
-    return NextResponse.json({ title, flashcards: cleaned });
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message ?? "Unknown error" },
+    return Response.json(json, { status: 200 });
+  } catch (e) {
+    console.error(e);
+    return Response.json(
+      { error: "Server error", details: String(e?.message || e) },
       { status: 500 }
     );
   }
-        }
-
+}
