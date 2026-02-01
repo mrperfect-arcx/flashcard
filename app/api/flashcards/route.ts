@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-export const runtime = "nodejs"; // important for Vercel
+export const runtime = "nodejs";
 
 type Flashcard = {
   question: string;
@@ -22,26 +22,8 @@ function extractJson(text: string): unknown {
   throw new Error("Model did not return valid JSON");
 }
 
-export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    const notes = String(body?.notes ?? "").trim();
-    const count = Math.max(3, Math.min(50, Number(body?.count ?? 12)));
-    const style = String(body?.style ?? "balanced");
-
-    if (!notes) {
-      return NextResponse.json({ error: "Notes are required" }, { status: 400 });
-    }
-
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Server misconfigured: missing GROQ_API_KEY" },
-        { status: 500 }
-      );
-    }
-
-    const prompt = `You are an expert flashcard creator.
+function buildFlashcardPrompt(userText: string, count: number, style: string): string {
+  return `You are an expert flashcard creator.
 Return ONLY valid JSON, no extra text.
 
 Create ${count} high-quality flashcards from the NOTES below.
@@ -62,7 +44,29 @@ Rules:
 - Style: ${style} (balanced = mix of definitions+concepts, exam = more application, simple = easy language)
 
 NOTES:
-${notes}`.trim();
+${userText}`.trim();
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const notes = String(body?.notes ?? "").trim();
+    const count = Math.max(3, Math.min(50, Number(body?.count ?? 12)));
+    const style = String(body?.style ?? "balanced");
+
+    if (!notes) {
+      return NextResponse.json({ error: "Notes are required" }, { status: 400 });
+    }
+
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "Server misconfigured: missing GROQ_API_KEY" },
+        { status: 500 }
+      );
+    }
+
+    const prompt = buildFlashcardPrompt(notes, count, style);
 
     const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -73,7 +77,6 @@ ${notes}`.trim();
       body: JSON.stringify({
         model: "llama-3.1-8b-instant",
         temperature: 0.3,
-        // Ask for strict JSON output (supported on Groq OpenAI-compatible endpoint)
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: "You output only valid JSON." },
@@ -91,20 +94,19 @@ ${notes}`.trim();
     }
 
     const data = await groqRes.json();
-    const text = data?.choices?.[0]?.message?.content;
+    const text: string | undefined = data?.choices?.[0]?.message?.content;
 
     if (!text) {
       return NextResponse.json({ error: "No response from Groq" }, { status: 502 });
     }
 
-    // Parse JSON (should already be JSON, but we keep your safe extractor)
-    const parsed = ((): any => {
+    const parsed = (() => {
       try {
         return JSON.parse(text);
       } catch {
         return extractJson(text);
       }
-    })();
+    })() as any;
 
     const title = String(parsed?.title ?? "Flashcards");
     const flashcards = Array.isArray(parsed?.flashcards) ? parsed.flashcards : [];
@@ -125,4 +127,4 @@ ${notes}`.trim();
       { status: 500 }
     );
   }
-}
+                       }
